@@ -14,10 +14,12 @@
 #   5. Configures git: user.name, user.email (from env vars), and registers
 #      gh as the github.com credential helper so `git clone` / `push` reuse
 #      the gh CLI's stored token.
-#   6. Appends PATH / alias / env exports to ~/.bashrc (managed block) so
-#      interactive shells pick up ~/.local/bin, run `claude` with
-#      --dangerously-skip-permissions, and — if ANTHROPIC_API_KEY was set
-#      at bootstrap time — export it for future shells.
+#   6. Appends PATH / `claude` wrapper / env exports to ~/.bashrc (managed
+#      block) so interactive shells pick up ~/.local/bin and run `claude` via
+#      a wrapper function that (a) passes --dangerously-skip-permissions and
+#      (b) pre-accepts the per-directory trust dialog for $PWD on each
+#      launch. If ANTHROPIC_API_KEY was set at bootstrap time, it is also
+#      exported for future shells.
 #
 # Optional env vars:
 #   ANTHROPIC_API_KEY    Pre-approved in ~/.claude.json and exported from the
@@ -30,13 +32,19 @@
 #   GIT_AUTHOR_EMAIL     `git config --global user.email`.
 #   CLAUDE_TRUSTED_DIRS  Colon-separated list of absolute directory paths to
 #                        pre-accept the "Do you trust the files in this
-#                        folder?" dialog for. Each path is seeded into
-#                        ~/.claude.json as
+#                        folder?" dialog for at bootstrap time. Each path is
+#                        seeded into ~/.claude.json as
 #                        projects["<path>"].hasTrustDialogAccepted=true.
+#                        $HOME is always seeded in addition, and the
+#                        ~/.bashrc 'claude' wrapper function also seeds $PWD
+#                        on every launch — so most users do not need to set
+#                        this. It only matters if you need a path trusted
+#                        before the wrapper ever runs (e.g. a non-interactive
+#                        script that invokes $HOME/.local/bin/claude directly
+#                        from a cwd outside $HOME).
 #                        The trust dialog is per-directory and is NOT
 #                        suppressed by --dangerously-skip-permissions,
-#                        CLAUDE_CODE_SANDBOXED, or bypassPermissions — so
-#                        unattended starts in a fresh cwd need this.
+#                        CLAUDE_CODE_SANDBOXED, or bypassPermissions.
 #
 # Can be run from a local checkout or piped via `curl ... | bash`. Safe to
 # re-run: existing settings.json and .claude.json are backed up before
@@ -186,13 +194,24 @@ if api_key:
         approved.append(fp)
     resp.setdefault("rejected", [])
     print(f"[bootstrap] pre-approved ANTHROPIC_API_KEY fingerprint ...{fp}")
+# Always seed $HOME (common first-login cwd) in addition to any user-supplied
+# CLAUDE_TRUSTED_DIRS. The bashrc 'claude' wrapper seeds $PWD on each launch,
+# but seeding $HOME here means even a 'claude --version' from $HOME before the
+# wrapper ever runs won't trip the dialog.
+home = os.environ.get("HOME", "")
 trusted_dirs = [d for d in trusted_dirs_raw.split(":") if d]
+if home and os.path.isabs(home):
+    trusted_dirs.append(os.path.realpath(home))
 if trusted_dirs:
     projects = data.setdefault("projects", {})
+    seen = set()
     for d in trusted_dirs:
         if not os.path.isabs(d):
             print(f"[bootstrap] WARN: CLAUDE_TRUSTED_DIRS entry is not absolute, skipping: {d}", file=sys.stderr)
             continue
+        if d in seen:
+            continue
+        seen.add(d)
         entry = projects.setdefault(d, {})
         entry["hasTrustDialogAccepted"] = True
         print(f"[bootstrap] pre-accepted trust dialog for {d}")
@@ -257,7 +276,53 @@ if [ -f "$HOME/.local/bin/env" ]; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 export CLAUDE_CODE_SANDBOXED=1
-alias claude='claude --dangerously-skip-permissions'
+# 'claude' is a shell function (not an alias) so we can (a) pass
+# --dangerously-skip-permissions and (b) pre-accept the per-directory "Do
+# you trust the files in this folder?" dialog for $PWD before launching.
+# The trust dialog is per-directory and is NOT suppressed by
+# --dangerously-skip-permissions, CLAUDE_CODE_SANDBOXED, or bypassPermissions,
+# so to run unattended from an arbitrary cwd we must seed
+# projects[<realpath(cwd)>].hasTrustDialogAccepted=true in ~/.claude.json on
+# each launch. Bootstrap-time CLAUDE_TRUSTED_DIRS only covers paths known in
+# advance; this wrapper covers the rest.
+claude() {
+    if command -v python3 >/dev/null 2>&1; then
+        _claude_cwd=$(cd -P -- "$PWD" 2>/dev/null && pwd) || _claude_cwd=""
+        if [ -n "$_claude_cwd" ]; then
+            python3 - "$HOME/.claude.json" "$_claude_cwd" <<'PY' || true
+import json, os, sys, tempfile
+path, d = sys.argv[1], sys.argv[2]
+if not os.path.isabs(d):
+    sys.exit(0)
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(d, {})
+if entry.get("hasTrustDialogAccepted") is True:
+    sys.exit(0)
+entry["hasTrustDialogAccepted"] = True
+# Atomic replace so a concurrent claude process sees either the old or the
+# new file, never a half-written one.
+parent = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=parent, prefix=".claude.json.")
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+PY
+        fi
+        unset _claude_cwd
+    fi
+    command claude --dangerously-skip-permissions "$@"
+}
 EOS
         if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
             printf 'export ANTHROPIC_API_KEY=%q\n' "$ANTHROPIC_API_KEY"
